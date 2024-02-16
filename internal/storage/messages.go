@@ -8,7 +8,7 @@ func (s *Storage) GetMessagesFromChat(chatID int64) ([]MessageModel, error) {
 	query := `
 		SELECT cm.id, cm.USER_ID, cm.IS_FILE, cm.MESSAGE, cm.READED_AT, cm.posted_at FROM ChatsMessages cm
 		WHERE cm.CHAT_ID = $1
-		ORDER BY cm.posted_at desc
+		ORDER BY cm.posted_at
 	`
 
 	rows, err := s.db.Query(query, chatID)
@@ -51,14 +51,15 @@ func (s *Storage) GetMessagesFromChat(chatID int64) ([]MessageModel, error) {
 	return result, nil
 }
 
-func (s *Storage) AddMessage(userId, chatId int64, message string, is_file bool) error {
+func (s *Storage) AddMessage(userId, chatId int64, message string, is_file bool) (int64, error) {
 	query := `
 		INSERT INTO ChatsMessages (USER_ID, CHAT_ID, MESSAGE, IS_FILE) 
-		VALUES($1, $2, $3, $4)
+		VALUES($1, $2, $3, $4) 
+		RETURNING id
 	`
-
-	_, err := s.db.Exec(query, userId, chatId, message, is_file)
-	return err
+	var messageId int64
+	err := s.db.QueryRow(query, userId, chatId, message, is_file).Scan(&messageId)
+	return messageId, err
 }
 
 func (s *Storage) MessageAreReaded(messageId, chatId int64) error {

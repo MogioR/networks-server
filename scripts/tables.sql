@@ -21,7 +21,7 @@ CREATE TABLE ChatsMessages(
     USER_ID INTEGER NOT NULL REFERENCES USERS(ID),
     IS_FILE boolean NOT NULL DEFAULT FALSE,
     MESSAGE text NOT NULL,
-    READED_AT timestamp DEFAULT '-infinity',
+    READED_AT timestamp DEFAULT '1001-01-01',
     posted_at timestamp default NOW()
     PRIMARY KEY(ID, CHAT_ID)
 )

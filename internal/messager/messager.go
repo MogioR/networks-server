@@ -113,7 +113,7 @@ for_lable:
 		if err != nil {
 			continue
 		}
-		m.processEvent(response[:n])
+		m.processEvent(response[:n], userId)
 	}
 
 	fmt.Printf("User %d disconnected\n", userId)
@@ -144,7 +144,7 @@ func (m *Messager) sendChats(conn net.Conn, userId int64) error {
 	return err
 }
 
-func (m *Messager) processEvent(eventMsg []byte) error {
+func (m *Messager) processEvent(eventMsg []byte, userId int64) error {
 	switch eventMsg[0] {
 	case 7:
 		msg, err := deseralizeChatCreate(eventMsg)
@@ -176,6 +176,36 @@ func (m *Messager) processEvent(eventMsg []byte) error {
 			}
 		}
 		m.usersMutex.RUnlock()
+	case 8:
+		msg, err := deserializeTextMessage(eventMsg)
+		if err != nil {
+			return err
+		}
+
+		messageId, err := m.storage.AddMessage(userId, msg.ChatId, msg.Message, msg.IsFile)
+		if err != nil {
+			return err
+		}
+		msg.Id = messageId
+		msg.PostedAt = time.Now()
+
+		users, err := m.storage.GetChatUsers(msg.ChatId)
+		if err != nil {
+			return err
+		}
+
+		buf, err := m.serializeMessage(msg)
+		if err != nil {
+			return err
+		}
+
+		m.tokensMutex.RLock()
+		for _, user := range users {
+			if conn, ok := m.users[user.Id]; ok {
+				conn.Write(buf)
+			}
+		}
+		m.tokensMutex.RUnlock()
 
 	default:
 		return fmt.Errorf("unknown event type")
