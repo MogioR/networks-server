@@ -1,0 +1,17 @@
+{
+    "log_level": "debug",
+    "api": {
+      "tcp_port": ":8000",
+      "http_port": ":8080",
+      "read_timeout": 30,
+      "write_timeout": 30,
+      "idle_timeout": 30
+    },
+    "postgres": {
+      "host": "localhost",
+      "port": 5432,
+      "db": "postgres",
+      "sslmode": "disable",
+      "max_conns": 2
+    }
+  }
