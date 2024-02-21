@@ -1,51 +1,30 @@
 package messager
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io/ioutil"
+	"messager-server/internal/messager/events"
 	"messager-server/internal/storage"
 	"net"
 	"sync"
 	"time"
 
 	log "github.com/sirupsen/logrus"
-
-	"github.com/google/uuid"
 )
 
 type Messager struct {
-	users        map[int64]net.Conn
-	secureTokens map[string]int64
-	storage      *storage.Storage
-
-	tokensMutex sync.RWMutex
-	usersMutex  sync.RWMutex
+	users      map[int64]net.Conn
+	storage    *storage.Storage
+	usersMutex sync.RWMutex
 }
 
 func NewMessager(storage *storage.Storage) *Messager {
 	return &Messager{
-		users:        make(map[int64]net.Conn, 0),
-		secureTokens: make(map[string]int64, 0),
-		storage:      storage,
-	}
-}
-
-func (m *Messager) GetTokenForUser(userId int64) (string, error) {
-	m.tokensMutex.Lock()
-	defer m.tokensMutex.Unlock()
-
-	if _, ok := m.users[userId]; !ok {
-		token := uuid.New().String()
-		m.secureTokens[token] = userId
-		return token, nil
-	} else {
-		m.usersMutex.Lock()
-		delete(m.users, userId)
-		m.usersMutex.Unlock()
-
-		token := uuid.New().String()
-		m.secureTokens[token] = userId
-		return token, nil
+		users:   make(map[int64]net.Conn, 0),
+		storage: storage,
 	}
 }
 
@@ -59,23 +38,42 @@ func (m *Messager) Auth(conn net.Conn) (int64, error) {
 		defer close(errCh)
 		defer close(resCh)
 
-		key := make([]byte, 1024)
-		n, err := conn.Read(key)
+		msgRaw := make([]byte, 1024)
+		n, err := conn.Read(msgRaw)
 		if err != nil {
 			errCh <- err
 			return
 		}
 
-		m.tokensMutex.RLock()
-		defer m.tokensMutex.RUnlock()
+		eventMsg := bytes.NewBuffer(msgRaw[:n])
 
-		if userId, ok := m.secureTokens[string(key[:n])]; ok {
-			resCh <- userId
-			return
-		} else {
-			errCh <- fmt.Errorf("wrong pass")
-			return
+		var authType int8
+		err = binary.Read(eventMsg, binary.BigEndian, &authType)
+		if err != nil || authType < 1 || authType > 2 {
+			errCh <- fmt.Errorf("wrong event")
 		}
+
+		var userId int64
+		if authType == 1 {
+			event := events.RegisterEvent{}
+			err = event.Deserialize(eventMsg)
+			if err != nil {
+				errCh <- fmt.Errorf("broken event")
+			}
+			userId, err = m.storage.Register(event.Login, event.Password)
+		} else {
+			event := events.LoginEvent{}
+			err = event.Deserialize(eventMsg)
+			if err != nil {
+				errCh <- fmt.Errorf("broken event")
+			}
+			userId, err = m.storage.Auth(event.Login, event.Password)
+		}
+		if err != nil {
+			errCh <- err
+		}
+
+		resCh <- userId
 	}()
 
 	select {
@@ -111,15 +109,25 @@ for_lable:
 		response := make([]byte, 1024)
 		n, err := conn.Read(response)
 		if err != nil {
-			continue
+			break
 		}
-		m.processEvent(response[:n], userId)
+		buf := bytes.NewBuffer(response[:n])
+
+		err = m.processEvent(buf, userId)
+		if err != nil {
+			event := events.SystemMessageEvent{
+				Code:    1,
+				Message: err.Error(),
+			}
+			conn.Write(event.Serialize().Bytes())
+		}
 	}
 
 	fmt.Printf("User %d disconnected\n", userId)
 	m.usersMutex.Lock()
 	delete(m.users, userId)
 	m.usersMutex.Unlock()
+	conn.Close()
 }
 
 func (m *Messager) sendChats(conn net.Conn, userId int64) error {
@@ -132,7 +140,46 @@ func (m *Messager) sendChats(conn net.Conn, userId int64) error {
 		chats = chats[:256]
 	}
 
-	message, err := m.serializeChats(chats)
+	event := events.ChatEvent{}
+	event.Chats = make([]*events.Chat, len(chats))
+	for i, chat := range chats {
+		event.Chats[i] = &events.Chat{
+			ChatId:   chat.Id,
+			ChatName: chat.Name,
+		}
+
+		event.Chats[i].Users = make([]events.User, len(chat.Users))
+		for j, user := range chat.Users {
+			event.Chats[i].Users[j] = events.User{
+				Id:    user.Id,
+				Login: user.Login,
+			}
+		}
+
+		messages, err := m.storage.GetMessagesFromChat(chat.Id)
+		if err != nil {
+			return err
+		}
+
+		event.Chats[i].Messages = make([]events.Message, len(messages))
+		for j, message := range messages {
+			var isFileByte byte
+			if message.IsFile {
+				isFileByte = 1
+			}
+
+			event.Chats[i].Messages[j] = events.Message{
+				Id:          message.Id,
+				SenderId:    message.UserId,
+				MessageType: isFileByte,
+				Message:     message.Message,
+				SendTime:    message.PostedAt,
+				ReadTime:    message.ReadedAt,
+			}
+		}
+	}
+
+	message, err := event.Serialize()
 	if err != nil {
 		return err
 	}
@@ -144,72 +191,190 @@ func (m *Messager) sendChats(conn net.Conn, userId int64) error {
 	return err
 }
 
-func (m *Messager) processEvent(eventMsg []byte, userId int64) error {
-	switch eventMsg[0] {
-	case 7:
-		msg, err := deseralizeChatCreate(eventMsg)
+func (m *Messager) processEvent(eventMsg *bytes.Buffer, userId int64) error {
+	var command int8
+	err := binary.Read(eventMsg, binary.BigEndian, &command)
+	if err != nil {
+		return err
+	}
+
+	switch command {
+	case 8:
+		event := events.SendTextEvent{}
+		err := event.Deserialize(eventMsg)
 		if err != nil {
 			return err
 		}
 
-		userIds, err := m.storage.CreateChat(msg.Name, msg.Users)
+		messageId, err := m.storage.AddMessage(userId, event.ChatId, event.Message, false)
 		if err != nil {
 			return err
 		}
 
-		for i, user := range msg.Users {
-			user.Id = userIds[i]
+		users, err := m.storage.GetChatUsers(event.ChatId)
+		if err != nil {
+			return err
 		}
 
-		message, err := m.serealizeEvendAddToChat(msg)
+		nilTime, _ := time.Parse("2006-01-02", "1001-01-01")
+		answerEvent := events.NewMessageEvent{
+			MessageId: messageId,
+			ChatId:    event.ChatId,
+			UserId:    userId,
+			IsFile:    false,
+			Message:   event.Message,
+			SendTime:  time.Now(),
+			ReadTime:  nilTime,
+		}
+
+		message, err := answerEvent.Serialize()
 		if err != nil {
 			return err
 		}
 
 		m.usersMutex.RLock()
-		for _, id := range userIds {
-			if _, ok := m.users[id]; ok {
-				_, err = m.users[id].Write(message)
+		for _, user := range users {
+			if _, ok := m.users[user.Id]; ok {
+				_, err = m.users[user.Id].Write(message.Bytes())
 				if err != nil {
 					log.Warn(err)
 				}
 			}
 		}
 		m.usersMutex.RUnlock()
-	case 8:
-		msg, err := deserializeTextMessage(eventMsg)
+	case 9:
+		event := events.SendFileInitEvent{}
+		err := event.Deserialize(eventMsg)
 		if err != nil {
 			return err
 		}
 
-		messageId, err := m.storage.AddMessage(userId, msg.ChatId, msg.Message, msg.IsFile)
-		if err != nil {
-			return err
-		}
-		msg.Id = messageId
-		msg.PostedAt = time.Now()
+		file := make([]byte, event.FileSize)
 
-		users, err := m.storage.GetChatUsers(msg.ChatId)
-		if err != nil {
-			return err
-		}
-
-		buf, err := m.serializeMessage(msg)
-		if err != nil {
-			return err
-		}
-
-		m.tokensMutex.RLock()
-		for _, user := range users {
-			if conn, ok := m.users[user.Id]; ok {
-				conn.Write(buf)
+		for i := 0; i < len(file); i += 1000 {
+			top := i + 1000
+			if top > len(file) {
+				top = len(file)
+			}
+			m.usersMutex.RLock()
+			_, err = m.users[userId].Read(file[i:top])
+			m.usersMutex.RUnlock()
+			if err != nil {
+				return err
 			}
 		}
-		m.tokensMutex.RUnlock()
+
+		messageId, err := m.storage.AddMessage(userId, event.ChatId, event.FileName, true)
+		if err != nil {
+			return err
+		}
+
+		err = SaveBytesToFile(fmt.Sprintf("files/%d_%d_%s", event.ChatId, messageId, event.FileName), file)
+		if err != nil {
+			return err
+		}
+
+		users, err := m.storage.GetChatUsers(event.ChatId)
+		if err != nil {
+			return err
+		}
+
+		nilTime, _ := time.Parse("2006-01-02", "1001-01-01")
+		answerEvent := events.NewMessageEvent{
+			MessageId: messageId,
+			ChatId:    event.ChatId,
+			UserId:    userId,
+			IsFile:    true,
+			Message:   event.FileName,
+			SendTime:  time.Now(),
+			ReadTime:  nilTime,
+		}
+
+		message, err := answerEvent.Serialize()
+		if err != nil {
+			return err
+		}
+
+		m.usersMutex.RLock()
+		for _, user := range users {
+			if _, ok := m.users[user.Id]; ok {
+				_, err = m.users[user.Id].Write(message.Bytes())
+				if err != nil {
+					log.Warn(err)
+				}
+			}
+		}
+		m.usersMutex.RUnlock()
+	case 13:
+		event := events.GetFileFromChatEvent{}
+		err := event.Deserialize(eventMsg)
+		if err != nil {
+			return err
+		}
+
+		messages, err := m.storage.GetMessagesFromChat(event.ChatId)
+		if err != nil {
+			return err
+		}
+
+		var fileName string
+		for _, message := range messages {
+			if message.Id == event.MessageId {
+				fileName = message.Message
+			}
+		}
+
+		file, err := ReadFileToBytes(fmt.Sprintf("files/%d_%d_%s", event.ChatId, event.MessageId, fileName))
+		if err != nil {
+			return err
+		}
+
+		answerEvent := events.SendFileToChatEvent{
+			FileName: fileName,
+			FileSize: int32(len(file)),
+		}
+
+		m.usersMutex.RLock()
+		_, err = m.users[userId].Write(answerEvent.Serialize().Bytes())
+		m.usersMutex.RUnlock()
+		if err != nil {
+			return err
+		}
+		for i := 0; i < len(file); i += 1000 {
+			top := i + 1000
+			if top > len(file) {
+				top = len(file)
+			}
+			m.usersMutex.RLock()
+			_, err = m.users[userId].Write(file[i:top])
+			m.usersMutex.RUnlock()
+			if err != nil {
+				return err
+			}
+		}
 
 	default:
 		return fmt.Errorf("unknown event type")
 	}
 
 	return nil
+}
+
+func SaveBytesToFile(filename string, data []byte) error {
+	// Используем функцию ioutil.WriteFile для записи данных в файл
+	err := ioutil.WriteFile(filename, data, 0644)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func ReadFileToBytes(filePath string) ([]byte, error) {
+	// Читаем содержимое файла в байтовый массив
+	content, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	return content, nil
 }

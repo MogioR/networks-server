@@ -24,6 +24,5 @@ services:
         limits:
           cpus: '1'
           memory: 4G
-
 volumes:
   postgres-data:

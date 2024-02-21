@@ -7,7 +7,7 @@ import (
 	"messager-server/internal/config"
 	"messager-server/internal/database"
 	"messager-server/internal/messager"
-	routes "messager-server/internal/route"
+	"messager-server/internal/messager/events"
 	"messager-server/internal/storage"
 	"net"
 	"os"
@@ -44,7 +44,6 @@ func main() {
 
 	storage := storage.New(psDb, logger)
 	m := messager.NewMessager(storage)
-	router := routes.New(storage, cfg, logger, m)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errChan := make(chan error, 1)
@@ -72,16 +71,14 @@ func main() {
 			if userId, err := m.Auth(conn); err == nil {
 				go m.ConsumerHeandler(ctx, conn, userId)
 			} else {
+				event := events.SystemMessageEvent{
+					Code:    0,
+					Message: err.Error(),
+				}
+				conn.Write(event.Serialize().Bytes())
 				fmt.Println(err)
 				conn.Close()
 			}
-		}
-	}()
-
-	fmt.Printf("HTTP server started on port %s\n", cfg.Api.HTTPPort)
-	go func() {
-		if err := router.Start(); err != nil {
-			errChan <- err
 		}
 	}()
 
